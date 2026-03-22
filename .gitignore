@@ -1,0 +1,8 @@
+node_modules/ 
+.next/ 
+backend/shop.db 
+backend/shop.db-wal 
+backend/shop.db-shm 
+__pycache__/ 
+*.pyc 
+.env 
