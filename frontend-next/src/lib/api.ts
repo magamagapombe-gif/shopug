@@ -1,5 +1,5 @@
 import axios from "axios";
-const api = axios.create({ baseURL: "http://localhost:8000" });
+const api = axios.create({ baseURL: "https://shopug.onrender.com" });
 api.interceptors.request.use(c => {
   if (typeof window !== "undefined") {
     const t = localStorage.getItem("token");
