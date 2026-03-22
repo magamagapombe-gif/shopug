@@ -1,4 +1,5 @@
 "use client";
+import { Suspense } from "react";
 import { useEffect, useState, useCallback } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { fetchProducts, fetchCategories } from "@/lib/api";
@@ -12,7 +13,7 @@ const SORTS = [
   { value: "rating", label: "Top Rated" },
 ];
 
-export default function ShopPage() {
+function ShopContent() {
   const sp     = useSearchParams();
   const router = useRouter();
   const [products, setProducts]   = useState<any[]>([]);
@@ -169,5 +170,13 @@ export default function ShopPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function ShopPage() {
+  return (
+    <Suspense fallback={<div className="max-w-7xl mx-auto px-4 py-8"><div className="h-40 bg-gray-100 rounded-2xl animate-pulse" /></div>}>
+      <ShopContent />
+    </Suspense>
   );
 }
