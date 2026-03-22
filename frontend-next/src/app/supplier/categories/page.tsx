@@ -32,7 +32,7 @@ export default function SupplierCategoriesPage() {
 
   const save = async () => {
     setSaving(true);
-    await setSupplierCategories([...selected]);
+    await setSupplierCategories(Array.from(selected));
     toast.success("Categories saved!");
     setSaving(false);
   };
