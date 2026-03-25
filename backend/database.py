@@ -16,22 +16,58 @@ if USE_TURSO:
 LOCAL_DB = os.path.join(os.path.dirname(__file__), "shop.db")
 
 
-def _dict_row_factory(cursor, row):
-    fields = [d[0] for d in cursor.description]
-    return dict(zip(fields, row))
+class TursoConnection:
+    """Wraps a libsql connection to return dicts and mimic sqlite3 API."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, params=None):
+        cursor = self._conn.execute(sql, params or [])
+        return TursoCursor(cursor)
+
+    def executemany(self, sql, seq):
+        return self._conn.executemany(sql, seq)
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
+
+class TursoCursor:
+    """Wraps a libsql cursor to return dicts from fetchone/fetchall."""
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.description = cursor.description
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        if row is None:
+            return None
+        return dict(zip([d[0] for d in self.description], row))
+
+    def fetchall(self):
+        rows = self._cursor.fetchall()
+        if not rows:
+            return []
+        cols = [d[0] for d in self.description]
+        return [dict(zip(cols, row)) for row in rows]
 
 
 def get_db():
     if USE_TURSO:
-        conn = libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
-        conn.row_factory = _dict_row_factory
+        raw = libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
+        return TursoConnection(raw)
     else:
         conn = sqlite3.connect(LOCAL_DB, timeout=60, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=DELETE")
         conn.execute("PRAGMA busy_timeout=60000")
         conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+        return conn
 
 
 def _executescript(conn, script: str):
