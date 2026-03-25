@@ -74,7 +74,7 @@ def list_products(
     order_map = {
         "price_asc":  "p.price ASC",
         "price_desc": "p.price DESC",
-        "rating":     "p.rating DESC NULLS LAST",
+        "rating":     "p.rating DESC",
         "id":         "p.id DESC",
     }
     order = order_map.get(sort, "p.id DESC")
@@ -82,11 +82,11 @@ def list_products(
     offset = (page - 1) * limit
 
     total = conn.execute(f"""
-        SELECT COUNT(*) FROM products p
+        SELECT COUNT(*) as total FROM products p
         LEFT JOIN categories c    ON p.category_id    = c.id
         LEFT JOIN subcategories s ON p.subcategory_id = s.id
         WHERE {where}
-    """, params).fetchone()[0]
+    """, params).fetchone()["total"]
 
     rows = conn.execute(f"""
         SELECT p.*,
@@ -127,7 +127,6 @@ def get_product(product_id: int):
         raise HTTPException(404, "Product not found")
     import json
     result = dict(row)
-    # Parse JSON fields into proper objects
     for field in ["specs", "colors", "sizes", "extra_images"]:
         if result.get(field):
             try:
@@ -148,7 +147,6 @@ def get_related(product_id: int, limit: int = Query(8, le=20)):
         conn.close()
         raise HTTPException(404, "Product not found")
 
-    # Mix: same subcategory OR same brand, exclude self, order by rating
     rows = conn.execute("""
         SELECT p.*,
                c.name as category_name, c.slug as category_slug,
@@ -165,7 +163,7 @@ def get_related(product_id: int, limit: int = Query(8, le=20)):
           )
         ORDER BY
             CASE WHEN p.subcategory_id = ? THEN 0 ELSE 1 END,
-            p.rating DESC NULLS LAST
+            p.rating DESC
         LIMIT ?
     """, (
         product_id,
@@ -244,7 +242,6 @@ def approve_supplier_product(sp_id: int, body: ApproveProduct, _=Depends(require
     if not sp:
         raise HTTPException(404, "Not found")
 
-    # Add to main products catalog with admin-set price
     conn.execute("""
         INSERT INTO products
           (subcategory_id, category_id, title, price, original_price,
@@ -253,23 +250,20 @@ def approve_supplier_product(sp_id: int, body: ApproveProduct, _=Depends(require
     """, (sp["subcategory_id"], sp["category_id"], sp["title"],
           body.final_price, sp["supplier_price"], sp["image_url"],
           datetime.utcnow().isoformat()))
-    product_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    product_id = conn.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
 
-    # Auto-add to supplier inventory
     conn.execute("""
         INSERT OR IGNORE INTO supplier_inventory
           (supplier_id, product_id, supply_price)
         VALUES (?,?,?)
     """, (sp["supplier_id"], product_id, sp["supplier_price"]))
 
-    # Mark as approved
     conn.execute("""
         UPDATE supplier_products
         SET status='approved', admin_note=?, reviewed_at=?
         WHERE id=?
     """, (body.admin_note, datetime.utcnow().isoformat(), sp_id))
 
-    # Notify supplier
     conn.execute("""
         INSERT INTO notifications (target, type, title, body)
         VALUES (?,?,?,?)
