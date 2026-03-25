@@ -1,16 +1,17 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 from database import get_db
 from auth_utils import require_customer, require_admin, get_current_user
-import os, uuid, requests
+import os, uuid, hmac, hashlib, time, requests
 
 router = APIRouter(tags=["orders"])
 
 LIVEPAY_SECRET = os.getenv("LIVEPAY_SECRET_KEY", "")
 LIVEPAY_PUBLIC = os.getenv("LIVEPAY_PUBLIC_KEY", "")
 LIVEPAY_URL    = "https://livepay.me/api/v1/collect-money"
+TEST_MODE      = os.getenv("LIVEPAY_TEST_MODE", "false").lower() == "true"
 
 
 def _normalise_phone(phone: str) -> str:
@@ -43,17 +44,26 @@ def _detect_network(phone: str) -> str:
 
 
 def _initiate_livepay(phone: str, amount: float, reference: str, network: str = None):
-    """Call LivePay collect-money. Returns (transaction_id, raw_response)."""
+    """
+    Call LivePay collect-money. Returns (transaction_id, raw_response).
+    If TEST_MODE=true or keys are missing, returns a fake transaction ID for testing.
+    """
     normalised = _normalise_phone(phone)
     net = network or _detect_network(normalised)
 
+    # ── Test / sandbox mode ──────────────────────────────────────────────────
+    if TEST_MODE or not LIVEPAY_PUBLIC or not LIVEPAY_SECRET:
+        fake_txn = f"TEST-{reference}"
+        return fake_txn, {"test_mode": True, "transaction_id": fake_txn}
+
+    # ── Live mode ────────────────────────────────────────────────────────────
     payload = {
         "apikey":       LIVEPAY_PUBLIC,
         "reference":    reference,
         "phone_number": normalised,
-        "amount":       max(500, int(amount)),   # LivePay min is 500 UGX
+        "amount":       max(500, int(amount)),   # LivePay minimum is 500 UGX
         "currency":     "UGX",
-        "network":      net,
+        "network":      net,                     # "MTN" or "AIRTEL"
     }
     headers = {
         "Content-Type":  "application/json",
@@ -68,7 +78,38 @@ def _initiate_livepay(phone: str, amount: float, reference: str, network: str = 
     if r.status_code != 201:
         raise HTTPException(400, data.get("message", "LivePay error"))
 
-    return data["data"].get("transaction_id", reference), data
+    txn_id = data.get("data", {}).get("transaction_id", reference)
+    return txn_id, data
+
+
+def _verify_livepay_signature(secret_key: str, signature_header: str, body: dict) -> bool:
+    """
+    Verify the livepay-signature header.
+    Format: t=TIMESTAMP,v=HMAC_SHA256_HEX
+    Signed data: timestamp + sorted(key+value pairs)
+    """
+    if not signature_header:
+        return False
+    import re
+    match = re.match(r"t=([0-9]+),v=([a-f0-9]{64})", signature_header)
+    if not match:
+        return False
+    received_ts  = match.group(1)
+    received_sig = match.group(2)
+
+    # Reject requests older than 5 minutes
+    if abs(int(time.time()) - int(received_ts)) > 300:
+        return False
+
+    # Build signed string: timestamp + sorted key+value pairs
+    signed = received_ts
+    for key in sorted(body.keys()):
+        signed += str(key) + str(body[key])
+
+    expected = hmac.new(
+        secret_key.encode(), signed.encode(), hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, received_sig)
 
 
 # ── Cart ──────────────────────────────────────────────────────────────────────
@@ -242,36 +283,75 @@ def place_order(body: OrderIn, payload=Depends(require_customer)):
     conn.commit()
     conn.close()
     return {
-        "order_id":       order_id,
-        "total":          total,
-        "status":         status,
-        "payment_ref":    livepay_txn_id,
-        "message":        "Check your phone to approve the Mobile Money payment." if body.payment_method == "mobile_money" else "Order placed!",
+        "order_id":    order_id,
+        "total":       total,
+        "status":      status,
+        "payment_ref": livepay_txn_id,
+        "message":     "Check your phone to approve the Mobile Money payment."
+                       if body.payment_method == "mobile_money" else "Order placed!",
     }
 
 
 # ── LivePay webhook — called by LivePay when payment is confirmed ─────────────
 
 @router.post("/webhooks/livepay")
-@router.post("/webhooks/livepay")
-def livepay_webhook(data: dict):
+async def livepay_webhook(request: Request):
     """
-    LivePay calls this URL when a transaction completes.
+    LivePay calls this when a transaction completes.
     Set webhook URL in your LivePay dashboard to:
       https://shopug.onrender.com/webhooks/livepay
+
+    Webhook payload fields (from LivePay docs):
+      status         — "Approved" | "Failed" | "Pending" | "Cancelled"
+      transaction_id — LivePay's transaction ID
+      reference_id   — your original reference (shopug-XXXX)
+      phone          — customer phone
+      amount         — amount charged
+      payment_method — "mtn" | "airtel"
+      charge_amount  — fee deducted
     """
-    txn_id = data.get("transaction_id") or data.get("reference")
-    status = data.get("status", "").lower()
-    if not txn_id:
-        return {"ok": False}
+    data = await request.json()
+    sig  = request.headers.get("livepay-signature", "")
+
+    # Verify signature (skip in test mode)
+    if not TEST_MODE and LIVEPAY_SECRET:
+        if not _verify_livepay_signature(LIVEPAY_SECRET, sig, data):
+            raise HTTPException(401, "Invalid webhook signature")
+
+    # LivePay uses "reference_id" (not "reference" or "transaction_id")
+    ref_id = data.get("reference_id") or data.get("transaction_id") or data.get("reference")
+    status = data.get("status", "").lower()   # "approved" | "failed" | "pending"
+
+    if not ref_id:
+        return {"ok": False, "reason": "no reference"}
 
     conn = get_db()
+    # Match by either the LivePay txn_id or our original reference
     order = conn.execute(
-        "SELECT id, user_id FROM orders WHERE payment_ref=?", (txn_id,)
+        "SELECT id, user_id FROM orders WHERE payment_ref=?", (ref_id,)
     ).fetchone()
 
+    # Also try matching by our reference prefix in case LivePay echoes it back
+    if not order:
+        order = conn.execute(
+            "SELECT id, user_id FROM orders WHERE payment_ref LIKE ?",
+            (f"{ref_id}%",)
+        ).fetchone()
+
     if order:
-        new_status = "paid" if status == "success" else "payment_failed"
+        if status == "approved":
+            new_status = "paid"
+            title = "Payment Confirmed ✅"
+            body_text = f"Your order #{order['id']} payment was successful."
+        elif status in ("failed", "cancelled"):
+            new_status = "payment_failed"
+            title = "Payment Failed ❌"
+            body_text = f"Your order #{order['id']} payment was not completed. Please try again."
+        else:
+            # pending — no action needed
+            conn.close()
+            return {"ok": True, "status": "pending_no_action"}
+
         conn.execute(
             "UPDATE orders SET status=?, updated_at=? WHERE id=?",
             (new_status, datetime.utcnow().isoformat(), order["id"])
@@ -279,13 +359,12 @@ def livepay_webhook(data: dict):
         conn.execute("""
             INSERT INTO notifications (target, type, title, body)
             VALUES (?,?,?,?)
-        """, (f"user:{order['user_id']}", "payment_update",
-              "Payment Confirmed" if new_status == "paid" else "Payment Failed",
-              f"Your order #{order['id']} payment was {'successful' if new_status == 'paid' else 'not completed'}."))
+        """, (f"user:{order['user_id']}", "payment_update", title, body_text))
         conn.commit()
 
     conn.close()
-    return {"ok": True}
+    # LivePay expects a 200 with this format
+    return {"status": "received", "message": "Webhook processed successfully"}
 
 
 @router.get("/orders")
@@ -328,7 +407,7 @@ def get_order(order_id: int, payload=Depends(get_current_user)):
     conn.close()
     return {
         **dict(o),
-        "items": [dict(i) for i in items],
+        "items":        [dict(i) for i in items],
         "fulfillments": [dict(f) for f in fulfillments],
     }
 
