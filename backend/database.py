@@ -1,7 +1,3 @@
-"""
-Database module — uses Turso in production, SQLite locally.
-Set TURSO_URL and TURSO_TOKEN environment variables for Turso.
-"""
 import os
 import sqlite3
 
@@ -11,17 +7,16 @@ USE_TURSO   = bool(TURSO_URL and TURSO_TOKEN)
 
 if USE_TURSO:
     try:
-        import libsql_experimental as libsql
+        import libsql
         print("✅ Using Turso database")
     except ImportError:
-        print("⚠️  libsql-experimental not installed — falling back to SQLite")
+        print("⚠️  libsql not installed — falling back to SQLite")
         USE_TURSO = False
 
 LOCAL_DB = os.path.join(os.path.dirname(__file__), "shop.db")
 
 
 def _dict_row_factory(cursor, row):
-    """Makes libsql rows behave like sqlite3.Row (dict-like access)."""
     fields = [d[0] for d in cursor.description]
     return dict(zip(fields, row))
 
@@ -36,12 +31,10 @@ def get_db():
         conn.execute("PRAGMA journal_mode=DELETE")
         conn.execute("PRAGMA busy_timeout=60000")
         conn.execute("PRAGMA foreign_keys=ON")
-
     return conn
 
 
 def _executescript(conn, script: str):
-    """Runs a multi-statement SQL script on both SQLite and libsql."""
     statements = [s.strip() for s in script.split(";") if s.strip()]
     for stmt in statements:
         conn.execute(stmt)
