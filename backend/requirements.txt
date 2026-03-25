@@ -4,5 +4,5 @@ pyjwt==2.8.0
 python-multipart==0.0.9
 libsql==0.1.11
 requests==2.32.3
-pydantic==2.7.1
+pydantic==2.7.4
 passlib[bcrypt]==1.7.4
