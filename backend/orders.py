@@ -4,8 +4,71 @@ from typing import Optional
 from datetime import datetime
 from database import get_db
 from auth_utils import require_customer, require_admin, get_current_user
+import os, uuid, requests
 
 router = APIRouter(tags=["orders"])
+
+LIVEPAY_SECRET = os.getenv("LIVEPAY_SECRET_KEY", "")
+LIVEPAY_PUBLIC = os.getenv("LIVEPAY_PUBLIC_KEY", "")
+LIVEPAY_URL    = "https://livepay.me/api/v1/collect-money"
+
+
+def _normalise_phone(phone: str) -> str:
+    """Convert 07XXXXXXXX or +2567XXXXXXXX → 2567XXXXXXXX"""
+    phone = phone.strip().replace(" ", "").replace("-", "")
+    if phone.startswith("+"):
+        phone = phone[1:]
+    if phone.startswith("0"):
+        phone = "256" + phone[1:]
+    return phone
+
+
+def _detect_network(phone: str) -> str:
+    """Auto-detect MTN vs Airtel from normalised Uganda number."""
+    mtn    = ("256770","256771","256772","256773","256774","256775",
+               "256776","256777","256778","256779","256750","256751",
+               "256752","256753","256754","256755","256756","256757",
+               "256758","256759","256780","256781","256782","256783")
+    airtel = ("256700","256701","256702","256703","256704","256705",
+               "256706","256707","256708","256709","256740","256741",
+               "256742","256743","256744","256745","256746","256747",
+               "256748","256749","256720","256721","256722","256723")
+    for prefix in mtn:
+        if phone.startswith(prefix):
+            return "MTN"
+    for prefix in airtel:
+        if phone.startswith(prefix):
+            return "AIRTEL"
+    return "MTN"  # fallback
+
+
+def _initiate_livepay(phone: str, amount: float, reference: str, network: str = None):
+    """Call LivePay collect-money. Returns (transaction_id, raw_response)."""
+    normalised = _normalise_phone(phone)
+    net = network or _detect_network(normalised)
+
+    payload = {
+        "apikey":       LIVEPAY_PUBLIC,
+        "reference":    reference,
+        "phone_number": normalised,
+        "amount":       max(500, int(amount)),   # LivePay min is 500 UGX
+        "currency":     "UGX",
+        "network":      net,
+    }
+    headers = {
+        "Content-Type":  "application/json",
+        "Authorization": f"Bearer {LIVEPAY_SECRET}",
+    }
+    try:
+        r = requests.post(LIVEPAY_URL, json=payload, headers=headers, timeout=30)
+        data = r.json()
+    except Exception as e:
+        raise HTTPException(502, f"LivePay unreachable: {e}")
+
+    if r.status_code != 201:
+        raise HTTPException(400, data.get("message", "LivePay error"))
+
+    return data["data"].get("transaction_id", reference), data
 
 
 # ── Cart ──────────────────────────────────────────────────────────────────────
@@ -89,6 +152,7 @@ class OrderIn(BaseModel):
     address:        str
     phone:          str
     payment_method: str = "mobile_money"
+    network:        Optional[str] = None   # "MTN" | "AIRTEL" — auto-detected if omitted
     payment_ref:    str = ""
 
 
@@ -106,16 +170,28 @@ def place_order(body: OrderIn, payload=Depends(require_customer)):
 
     total = sum((i["price"] or 0) * i["quantity"] for i in cart)
     now   = datetime.utcnow().isoformat()
+    ref   = f"shopug-{uuid.uuid4().hex[:16]}"
 
-    # Create order
+    # ── Initiate LivePay payment first (before saving order) ──
+    livepay_txn_id = body.payment_ref  # fallback for non-mobile-money
+    if body.payment_method == "mobile_money":
+        livepay_txn_id, _ = _initiate_livepay(
+            phone=body.phone,
+            amount=total,
+            reference=ref,
+            network=body.network,
+        )
+
+    # ── Create order (status = pending_payment until webhook confirms) ──
+    status = "pending_payment" if body.payment_method == "mobile_money" else "paid"
     cur = conn.execute("""
-        INSERT INTO orders (user_id, total, address, phone, payment_method, payment_ref, created_at, updated_at)
-        VALUES (?,?,?,?,?,?,?,?)
+        INSERT INTO orders (user_id, total, address, phone, payment_method,
+                            payment_ref, status, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?)
     """, (payload["sub"], total, body.address, body.phone,
-          body.payment_method, body.payment_ref, now, now))
+          body.payment_method, livepay_txn_id, status, now, now))
     order_id = cur.lastrowid
 
-    # Create order items + open bids for each
     for item in cart:
         cur2 = conn.execute("""
             INSERT INTO order_items (order_id, product_id, quantity, price, title)
@@ -124,7 +200,6 @@ def place_order(body: OrderIn, payload=Depends(require_customer)):
               item["price"] or 0, item["title"]))
         item_id = cur2.lastrowid
 
-        # Find eligible suppliers for this product and notify them
         suppliers = conn.execute("""
             SELECT si.supplier_id, si.supply_price, s.tier, s.rating,
                    s.fulfilled_orders, s.avg_delivery_hrs
@@ -135,7 +210,6 @@ def place_order(body: OrderIn, payload=Depends(require_customer)):
         """, (item["product_id"],)).fetchall()
 
         for sup in suppliers:
-            # Compute score: lower supply_price is better, higher rating/tier better
             tier_bonus = {"gold": 15, "silver": 8, "bronze": 0}.get(sup["tier"], 0)
             score = (
                 (1 / (sup["supply_price"] + 1)) * 1000
@@ -150,8 +224,6 @@ def place_order(body: OrderIn, payload=Depends(require_customer)):
                 VALUES (?,?,?,?,?)
             """, (order_id, item_id, sup["supplier_id"],
                   sup["supply_price"], round(score, 2)))
-
-            # Notify supplier
             conn.execute("""
                 INSERT INTO notifications (target, type, title, body, data)
                 VALUES (?,?,?,?,?)
@@ -160,10 +232,7 @@ def place_order(body: OrderIn, payload=Depends(require_customer)):
                   f"A new order for '{item['title']}' is available.",
                   f'{{"order_id":{order_id},"item_id":{item_id}}}'))
 
-    # Clear cart
     conn.execute("DELETE FROM carts WHERE user_id=?", (payload["sub"],))
-
-    # Notify admin
     conn.execute("""
         INSERT INTO notifications (target, type, title, body, data)
         VALUES ('admin','new_order','New Order Received',?,?)
@@ -172,7 +241,50 @@ def place_order(body: OrderIn, payload=Depends(require_customer)):
 
     conn.commit()
     conn.close()
-    return {"order_id": order_id, "total": total, "status": "paid"}
+    return {
+        "order_id":       order_id,
+        "total":          total,
+        "status":         status,
+        "payment_ref":    livepay_txn_id,
+        "message":        "Check your phone to approve the Mobile Money payment." if body.payment_method == "mobile_money" else "Order placed!",
+    }
+
+
+# ── LivePay webhook — called by LivePay when payment is confirmed ─────────────
+
+@router.post("/webhooks/livepay")
+def livepay_webhook(data: dict):
+    """
+    LivePay calls this URL when a transaction completes.
+    Set webhook URL in your LivePay dashboard to:
+      https://shopug.onrender.com/webhooks/livepay
+    """
+    txn_id = data.get("transaction_id") or data.get("reference")
+    status = data.get("status", "").lower()
+    if not txn_id:
+        return {"ok": False}
+
+    conn = get_db()
+    order = conn.execute(
+        "SELECT id, user_id FROM orders WHERE payment_ref=?", (txn_id,)
+    ).fetchone()
+
+    if order:
+        new_status = "paid" if status == "success" else "payment_failed"
+        conn.execute(
+            "UPDATE orders SET status=?, updated_at=? WHERE id=?",
+            (new_status, datetime.utcnow().isoformat(), order["id"])
+        )
+        conn.execute("""
+            INSERT INTO notifications (target, type, title, body)
+            VALUES (?,?,?,?)
+        """, (f"user:{order['user_id']}", "payment_update",
+              "Payment Confirmed" if new_status == "paid" else "Payment Failed",
+              f"Your order #{order['id']} payment was {'successful' if new_status == 'paid' else 'not completed'}."))
+        conn.commit()
+
+    conn.close()
+    return {"ok": True}
 
 
 @router.get("/orders")
@@ -200,7 +312,6 @@ def get_order(order_id: int, payload=Depends(get_current_user)):
     o = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
     if not o:
         raise HTTPException(404, "Order not found")
-    # Customers can only see their own
     if payload["role"] == "customer" and o["user_id"] != payload["sub"]:
         raise HTTPException(403, "Forbidden")
     items = conn.execute("""
@@ -224,36 +335,29 @@ def get_order(order_id: int, payload=Depends(get_current_user)):
 # ── Complaints ────────────────────────────────────────────────────────────────
 
 class ComplaintIn(BaseModel):
-    order_id:    int
-    description: str
+    order_id:     int
+    description:  str
     evidence_url: Optional[str] = None
 
 
 @router.post("/complaints")
 def file_complaint(body: ComplaintIn, payload=Depends(require_customer)):
     conn = get_db()
-    # Verify order belongs to user
     o = conn.execute(
         "SELECT id FROM orders WHERE id=? AND user_id=?",
         (body.order_id, payload["sub"])
     ).fetchone()
     if not o:
         raise HTTPException(404, "Order not found")
-
-    # Trace which supplier fulfilled it
     fulfillment = conn.execute("""
-        SELECT supplier_id FROM order_fulfillments
-        WHERE order_id=? LIMIT 1
+        SELECT supplier_id FROM order_fulfillments WHERE order_id=? LIMIT 1
     """, (body.order_id,)).fetchone()
     supplier_id = fulfillment["supplier_id"] if fulfillment else None
-
     conn.execute("""
         INSERT INTO complaints (order_id, user_id, supplier_id, description, evidence_url)
         VALUES (?,?,?,?,?)
     """, (body.order_id, payload["sub"], supplier_id,
           body.description, body.evidence_url))
-
-    # Notify admin
     conn.execute("""
         INSERT INTO notifications (target, type, title, body)
         VALUES ('admin','complaint','Customer Complaint',?)
@@ -263,12 +367,12 @@ def file_complaint(body: ComplaintIn, payload=Depends(require_customer)):
     return {"ok": True, "message": "Complaint filed. We will investigate."}
 
 
-# ── Admin: orders management ──────────────────────────────────────────────────
+# ── Admin ─────────────────────────────────────────────────────────────────────
 
 VALID_STATUSES = {
-    "paid", "supplier_assigned", "supplier_confirmed",
-    "in_transit", "inspecting", "out_for_delivery",
-    "delivered", "completed", "cancelled"
+    "paid", "pending_payment", "payment_failed", "supplier_assigned",
+    "supplier_confirmed", "in_transit", "inspecting",
+    "out_for_delivery", "delivered", "completed", "cancelled"
 }
 
 
@@ -310,13 +414,12 @@ def admin_list_orders(status: Optional[str] = None, _=Depends(require_admin)):
 @router.patch("/admin/orders/{order_id}/status")
 def update_order_status(order_id: int, status: str, _=Depends(require_admin)):
     if status not in VALID_STATUSES:
-        raise HTTPException(400, f"Invalid status")
+        raise HTTPException(400, "Invalid status")
     conn = get_db()
     conn.execute(
         "UPDATE orders SET status=?, updated_at=? WHERE id=?",
         (status, datetime.utcnow().isoformat(), order_id)
     )
-    # Notify customer
     o = conn.execute("SELECT user_id FROM orders WHERE id=?", (order_id,)).fetchone()
     if o:
         conn.execute("""
@@ -359,7 +462,6 @@ def resolve_complaint(
     conn.execute("""
         UPDATE complaints SET status=?, resolution=?, resolved_at=? WHERE id=?
     """, (status, resolution, datetime.utcnow().isoformat(), complaint_id))
-    # If resolved against supplier — add strike
     if status == "resolved" and c["supplier_id"]:
         conn.execute("""
             UPDATE suppliers SET rating = MAX(0, rating - 0.5) WHERE id=?
