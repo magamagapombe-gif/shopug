@@ -253,6 +253,7 @@ def place_order(body: OrderIn, payload=Depends(require_customer)):
 # ── LivePay webhook — called by LivePay when payment is confirmed ─────────────
 
 @router.post("/webhooks/livepay")
+@router.post("/webhooks/livepay")
 def livepay_webhook(data: dict):
     """
     LivePay calls this URL when a transaction completes.

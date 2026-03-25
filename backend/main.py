@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from database import init_db
@@ -7,7 +8,14 @@ from orders  import router as orders_router
 from suppliers import router as suppliers_router
 from admin   import router as admin_router
 
-app = FastAPI(title="ShopUG API", version="2.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="ShopUG API", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,11 +34,6 @@ app.include_router(products_router)
 app.include_router(orders_router)
 app.include_router(suppliers_router)
 app.include_router(admin_router)
-
-
-@app.on_event("startup")
-def startup():
-    init_db()
 
 
 @app.get("/")
