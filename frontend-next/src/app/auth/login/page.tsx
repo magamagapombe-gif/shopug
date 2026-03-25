@@ -17,7 +17,7 @@ export default function LoginPage() {
     e.preventDefault(); setLoading(true);
     try {
       const d = await loginCustomer({ email, password: pass });
-      setAuth(d.token, { name: d.name, email: d.email, is_admin: d.is_admin, role: d.role });
+      setAuth(d.token || d.access_token, { name: d.name, email: d.email, is_admin: d.is_admin, role: d.role });
       toast.success(`Welcome back, ${d.name}!`);
       router.push(d.is_admin ? "/admin" : "/");
     } catch (e: any) { toast.error(e?.response?.data?.detail || "Invalid credentials"); }

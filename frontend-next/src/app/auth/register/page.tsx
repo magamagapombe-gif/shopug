@@ -20,7 +20,7 @@ export default function RegisterPage() {
     setLoading(true);
     try {
       const d = await registerCustomer({ name: form.name, email: form.email, phone: form.phone, password: form.password });
-      setAuth(d.token, { name: d.name, email: d.email, is_admin: false, role: d.role });
+      setAuth(d.token || d.access_token, { name: d.name, email: d.email, is_admin: false, role: d.role });
       toast.success("Account created!"); router.push("/");
     } catch (e: any) { toast.error(e?.response?.data?.detail || "Registration failed"); }
     setLoading(false);

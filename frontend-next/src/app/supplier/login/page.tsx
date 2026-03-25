@@ -18,7 +18,7 @@ export default function SupplierLoginPage() {
     e.preventDefault(); setLoading(true);
     try {
       const d = await loginSupplier({ email, password: pass });
-      setAuth(d.token, { name: d.name, email, is_admin: false, role: "supplier" });
+      setAuth(d.token || d.access_token, { name: d.name, email, is_admin: false, role: "supplier" });
       toast.success(`Welcome, ${d.name}!`);
       router.push("/supplier/dashboard");
     } catch (e: any) { toast.error(e?.response?.data?.detail || "Login failed"); }
